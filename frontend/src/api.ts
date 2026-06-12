@@ -30,6 +30,58 @@ export interface ChatResponse {
   };
 }
 
+export interface GitHubStatus {
+  connected: boolean;
+  login?: string;
+  avatar_url?: string;
+}
+
+export interface GitHubRepo {
+  id: number;
+  name: string;
+  full_name: string;
+  description: string | null;
+  private: boolean;
+  html_url: string;
+  default_branch: string;
+  updated_at: string;
+}
+
+export interface GitHubBranch {
+  name: string;
+  commit: {
+    sha: string;
+    url: string;
+  };
+}
+
+export interface GitHubContent {
+  name: string;
+  path: string;
+  type: string;
+  size?: number;
+  sha: string;
+  download_url?: string;
+  html_url: string;
+}
+
+export interface GitHubFile {
+  path: string;
+  name: string;
+  size: number;
+  content: string;
+  sha: string;
+}
+
+export interface GitHubContext {
+  linked: boolean;
+  owner?: string;
+  repo?: string;
+  full_name?: string;
+  ref?: string;
+  paths?: string[];
+}
+
 class ApiClient {
   private apiKey: string | null = null;
   private baseUrl: string;
@@ -112,10 +164,157 @@ class ApiClient {
     });
   }
 
+  async *sendMessageStreaming(
+    sessionId: string,
+    message: string,
+    model?: string
+  ): AsyncGenerator<string, void, unknown> {
+    const apiKey = this.getApiKey();
+    if (!apiKey) {
+      throw new Error('API key not set');
+    }
+
+    const response = await fetch(`${this.baseUrl}/sessions/${sessionId}/chat`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ message, model, stream: true }),
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`API error: ${response.status} - ${error}`);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('Response body is not readable');
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6).trim();
+            if (data === '[DONE]') {
+              return;
+            }
+            if (data) {
+              try {
+                const parsed = JSON.parse(data);
+                if (parsed.error) {
+                  throw new Error(parsed.error);
+                }
+                if (parsed.choices && parsed.choices[0]?.delta?.content) {
+                  yield parsed.choices[0].delta.content;
+                }
+              } catch (e) {
+                if (e instanceof Error && e.message.startsWith('API error')) {
+                  throw e;
+                }
+                // Ignore JSON parse errors for partial chunks
+              }
+            }
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
   async deleteSession(sessionId: string): Promise<void> {
     await this.request(`/sessions/${sessionId}`, {
       method: 'DELETE',
     });
+  }
+
+  async getSessionGithubContext(sessionId: string): Promise<GitHubContext> {
+    return this.request<GitHubContext>(`/sessions/${sessionId}/github-context`);
+  }
+
+  async setSessionGithubContext(
+    sessionId: string,
+    owner: string,
+    repo: string,
+    ref?: string,
+    paths?: string[]
+  ): Promise<GitHubContext> {
+    return this.request<GitHubContext>(`/sessions/${sessionId}/github-context`, {
+      method: 'POST',
+      body: JSON.stringify({ owner, repo, ref, paths: paths || [] }),
+    });
+  }
+
+  async addSessionGithubFiles(sessionId: string, paths: string[]): Promise<GitHubContext> {
+    return this.request<GitHubContext>(`/sessions/${sessionId}/github-context/files`, {
+      method: 'POST',
+      body: JSON.stringify({ paths }),
+    });
+  }
+
+  async clearSessionGithubContext(sessionId: string): Promise<void> {
+    await this.request(`/sessions/${sessionId}/github-context`, {
+      method: 'DELETE',
+    });
+  }
+
+  // GitHub OAuth methods
+  async getGithubStatus(): Promise<GitHubStatus> {
+    return this.request<GitHubStatus>('/auth/github/status');
+  }
+
+  async startGithubOAuth(): Promise<{ authorization_url: string }> {
+    return this.request<{ authorization_url: string }>('/auth/github/login');
+  }
+
+  async connectGithub(): Promise<void> {
+    const response = await this.startGithubOAuth();
+    window.location.href = response.authorization_url;
+  }
+
+  async disconnectGithub(): Promise<void> {
+    await this.request('/auth/github/disconnect', {
+      method: 'DELETE',
+    });
+  }
+
+  // GitHub Repository methods
+  async listGithubRepos(page: number = 1): Promise<GitHubRepo[]> {
+    return this.request<GitHubRepo[]>(`/github/repos?per_page=100&page=${page}`);
+  }
+
+  async getGithubRepo(owner: string, repo: string): Promise<any> {
+    return this.request(`/github/repos/${owner}/${repo}`);
+  }
+
+  async listGithubBranches(owner: string, repo: string): Promise<GitHubBranch[]> {
+    return this.request<GitHubBranch[]>(`/github/repos/${owner}/${repo}/branches`);
+  }
+
+  async getGithubContents(owner: string, repo: string, path: string = '', ref?: string): Promise<GitHubContent[]> {
+    const params = ref ? `?ref=${ref}` : '';
+    const result = await this.request<GitHubContent | GitHubContent[]>(
+      `/github/repos/${owner}/${repo}/contents/${path}${params}`
+    );
+    return Array.isArray(result) ? result : [result];
+  }
+
+  async getGithubFileContent(owner: string, repo: string, path: string, ref?: string): Promise<GitHubFile> {
+    const params = ref ? `?ref=${ref}` : '';
+    return this.request<GitHubFile>(`/github/repos/${owner}/${repo}/file/${path}${params}`);
   }
 }
 
